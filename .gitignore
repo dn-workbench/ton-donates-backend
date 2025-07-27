@@ -1,0 +1,4 @@
+# Добавь в .gitignore:
+.env
+service-account.json
+stats.json
