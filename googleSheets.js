@@ -1,16 +1,18 @@
-require("dotenv").config(); // 👈 Загружаем .env
-
+require("dotenv").config();
 const { google } = require("googleapis");
-const keys = require(process.env.GOOGLE_CREDENTIALS_PATH); // 🔐 Путь из .env
+
+// Загружаем JSON из переменной окружения
+const keys = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
 
 const SCOPES = ["https://www.googleapis.com/auth/spreadsheets"];
+
 const auth = new google.auth.GoogleAuth({
   credentials: keys,
   scopes: SCOPES,
 });
 
 const sheets = google.sheets({ version: "v4", auth });
-const SPREADSHEET_ID = process.env.SPREADSHEET_ID; // 📄 Идентификатор таблицы
+const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 
 async function updateStats(stats) {
   const values = Object.entries(stats).map(([country, amount]) => [
@@ -18,7 +20,7 @@ async function updateStats(stats) {
     amount.toFixed(2),
   ]);
 
-  values.unshift(["Country", "Amount"]);
+  values.unshift(["Country", "Amount"]); // Заголовок
 
   const resource = { values };
 

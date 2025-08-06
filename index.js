@@ -32,13 +32,13 @@ function saveStats() {
 async function fetchTransactions() {
   try {
     const fakeTransactions = [
-      { in_msg: { comment: "Ukraine" }, amount: 811311 * 1e9 },
-      { in_msg: { comment: "Germany" }, amount: 222242 * 1e9 },
-      { in_msg: { comment: "United States" }, amount: 92125 * 1e9 },
-      { in_msg: { comment: "France" }, amount: 521121 * 1e9 },
-      { in_msg: { comment: "Japan" }, amount: 54 * 1e9 },
-      { in_msg: { comment: "Brazil" }, amount: 22.2 * 1e9 },
-      { in_msg: { comment: "Ukraine" }, amount: 12 * 1e9 },
+      { in_msg: { comment: "Ukraine" }, amount: 1 * 1e9 },
+      { in_msg: { comment: "Germany" }, amount: 2 * 1e9 },
+      { in_msg: { comment: "United States" }, amount: 925 * 1e9 },
+      { in_msg: { comment: "France" }, amount: 51 * 1e9 },
+      { in_msg: { comment: "Japan" }, amount: 986 * 1e9 },
+      { in_msg: { comment: "Brazil" }, amount: 22 * 1e9 },
+      { in_msg: { comment: "Russia" }, amount: 982 * 1e9 },
     ];
 
     stats = {};

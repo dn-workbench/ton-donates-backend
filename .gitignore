@@ -2,3 +2,4 @@
 .env
 service-account.json
 stats.json
+node_modules/
