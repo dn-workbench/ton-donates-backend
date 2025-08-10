@@ -34,9 +34,10 @@ const TON_WALLET = process.env.TON_WALLET;
 const TONAPI_KEY = process.env.TONAPI_KEY || "";
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 30000);
 
+const ADMIN_KEY = process.env.ADMIN_KEY || ""; // <-- добавь в .env
+
 // ===== Fastify app =====
 const app = fastify({ logger: false });
-
 app.register(cors, {
   origin: FRONTEND_ORIGIN === "*" ? true : FRONTEND_ORIGIN,
 });
@@ -65,7 +66,6 @@ console.log("📄 STATE_FILE:", path.resolve(STATE_FILE));
 // ===== state & stats =====
 let stats = safeReadJSON(STATS_FILE, {});
 let state = Object.assign({ lastSeenTxId: null }, safeReadJSON(STATE_FILE, {}));
-
 const NANOTONS = 1e9;
 
 // — базовые 40 стран — чтобы /stats никогда не был пустым —
@@ -112,11 +112,8 @@ const BASE_COUNTRIES = [
   "Austria",
 ];
 function ensureBaseCountries(obj) {
-  for (const c of BASE_COUNTRIES) {
-    if (obj[c] == null) obj[c] = 0;
-  }
+  for (const c of BASE_COUNTRIES) if (obj[c] == null) obj[c] = 0;
 }
-// гарантируем базу сразу при старте
 ensureBaseCountries(stats);
 
 // — нормализация стран по комменту —
@@ -137,27 +134,16 @@ function normalizeCountry(raw) {
   if (!raw || typeof raw !== "string") return null;
   const s = raw.trim();
   if (!s) return null;
-
-  // точное совпадение как есть
   if (COUNTRY_SET.has(s)) return s;
-
-  // алиасы по верхнему регистру
   const upper = s.toUpperCase();
   if (ALIASES[upper]) return ALIASES[upper];
-
-  // тайтлкейс
   const title =
     s.length < 3 ? s.toUpperCase() : s[0].toUpperCase() + s.slice(1);
   if (COUNTRY_SET.has(title)) return title;
-
-  // полное lower-case совпадение
   const lower = s.toLowerCase();
-  for (const c of COUNTRY_SET) {
-    if (c.toLowerCase() === lower) return c;
-  }
+  for (const c of COUNTRY_SET) if (c.toLowerCase() === lower) return c;
   return null;
 }
-
 function addDonation(country, amountTON) {
   if (!country || isNaN(amountTON) || amountTON <= 0) return;
   if (!stats[country]) stats[country] = 0;
@@ -205,28 +191,24 @@ async function fetchFromTonapi() {
 async function pollOnce() {
   try {
     await fetchFromTonapi();
-
-    // гарантируем базовые страны каждый проход
-    ensureBaseCountries(stats);
+    ensureBaseCountries(stats); // на всякий случай
 
     // сохраняем кэш
     safeWriteJSON(STATS_FILE, stats);
     safeWriteJSON(STATE_FILE, state);
 
     // отправляем в Google Sheets (если модуль реально подключен)
-    let sheetsOk = false;
     try {
       if (
         typeof updateStats === "function" &&
         updateStats !== (async () => {})
       ) {
         await updateStats(stats);
-        sheetsOk = true;
+        console.log("✅ Google Sheet обновлён");
       }
     } catch (e) {
       console.warn("⚠️  Sheets ошибка:", e.message);
     }
-    if (sheetsOk) console.log("✅ Google Sheet обновлён");
 
     const top5 = Object.entries(stats)
       .sort((a, b) => b[1] - a[1])
@@ -244,16 +226,116 @@ function startPolling() {
   pollOnce();
 }
 
+// ===== utils: админ-ключ =====
+function getAdminKey(req) {
+  // можно передавать в заголовке или в теле
+  return req.headers["x-admin-key"] || (req.body && req.body.key) || "";
+}
+
 // ===== routes =====
+app.get("/", async (_req, reply) => {
+  reply.send({
+    ok: true,
+    message: "TON donations backend",
+    endpoints: ["/health", "/stats"],
+  });
+});
+
 app.get("/health", async (_req, reply) => {
   reply.send({ ok: true, lastSeenTxId: state.lastSeenTxId });
 });
 
 app.get("/stats", async (_req, reply) => {
-  // отдаём всегда с базой (на случай, если кто-то руками потёр файл)
   ensureBaseCountries(stats);
   reply.header("Cache-Control", "no-store");
   reply.send(stats);
+});
+
+// === ADMIN: установить абсолютное значение по стране ===
+// Body: { key: string, country: string, amount: number }
+app.post("/admin/update-country", async (req, reply) => {
+  try {
+    const key = getAdminKey(req);
+    if (!ADMIN_KEY || key !== ADMIN_KEY)
+      return reply.code(403).send({ error: "Forbidden" });
+
+    const { country, amount } = req.body || {};
+    const normalized = normalizeCountry(country);
+    if (!normalized) return reply.code(400).send({ error: "Unknown country" });
+
+    const num = Number(amount);
+    if (!Number.isFinite(num) || num < 0)
+      return reply.code(400).send({ error: "Invalid amount" });
+
+    stats[normalized] = Number(num.toFixed(6));
+    ensureBaseCountries(stats);
+    safeWriteJSON(STATS_FILE, stats);
+
+    try {
+      if (
+        typeof updateStats === "function" &&
+        updateStats !== (async () => {})
+      ) {
+        await updateStats(stats);
+      }
+    } catch (e) {
+      console.warn("⚠️  Sheets ошибка:", e.message);
+    }
+
+    return reply.send({
+      ok: true,
+      country: normalized,
+      amount: stats[normalized],
+    });
+  } catch (e) {
+    console.error("❌ /admin/update-country:", e);
+    return reply.code(500).send({ error: "Internal error" });
+  }
+});
+
+// === ADMIN: инкремент/добавить сумму к стране ===
+// Body: { key: string, country: string, delta: number }
+app.post("/admin/add-country", async (req, reply) => {
+  try {
+    const key = getAdminKey(req);
+    if (!ADMIN_KEY || key !== ADMIN_KEY)
+      return reply.code(403).send({ error: "Forbidden" });
+
+    const { country, delta } = req.body || {};
+    const normalized = normalizeCountry(country);
+    if (!normalized) return reply.code(400).send({ error: "Unknown country" });
+
+    const d = Number(delta);
+    if (!Number.isFinite(d))
+      return reply.code(400).send({ error: "Invalid delta" });
+
+    if (!stats[normalized]) stats[normalized] = 0;
+    stats[normalized] = Number((stats[normalized] + d).toFixed(6));
+    if (stats[normalized] < 0) stats[normalized] = 0;
+
+    ensureBaseCountries(stats);
+    safeWriteJSON(STATS_FILE, stats);
+
+    try {
+      if (
+        typeof updateStats === "function" &&
+        updateStats !== (async () => {})
+      ) {
+        await updateStats(stats);
+      }
+    } catch (e) {
+      console.warn("⚠️  Sheets ошибка:", e.message);
+    }
+
+    return reply.send({
+      ok: true,
+      country: normalized,
+      amount: stats[normalized],
+    });
+  } catch (e) {
+    console.error("❌ /admin/add-country:", e);
+    return reply.code(500).send({ error: "Internal error" });
+  }
 });
 
 // ===== start =====
