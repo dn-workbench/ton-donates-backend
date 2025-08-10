@@ -12,7 +12,26 @@
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
-    "googleapis": "^126.0.1"
+    "googleapis": "^126.0.1",
+    "debug": "2.6.9"
+  },
+  "overrides": {
+    "debug": "2.6.9",
+    "express": {
+      "debug": "2.6.9",
+      "finalhandler": {
+        "debug": "2.6.9"
+      },
+      "send": {
+        "debug": "2.6.9"
+      }
+    },
+    "finalhandler": {
+      "debug": "2.6.9"
+    },
+    "send": {
+      "debug": "2.6.9"
+    }
   },
   "engines": {
     "node": "20.x"
