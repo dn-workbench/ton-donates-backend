@@ -14,7 +14,7 @@ async function updateStats(statsObj) {
     // Загружаем сервисный аккаунт
     let creds;
     if (process.env.GOOGLE_CREDENTIALS) {
-      creds = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+      const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS);
     } else if (process.env.GOOGLE_CREDENTIALS_PATH) {
       creds = require(process.env.GOOGLE_CREDENTIALS_PATH);
     } else {
