@@ -1,3 +1,5 @@
+// index.js (Fastify backend with robust CORS)
+
 require("dotenv").config();
 
 const fastify = require("fastify");
@@ -25,7 +27,17 @@ process.on("unhandledRejection", (reason) =>
 // ===== ENV =====
 const PORT = Number(process.env.PORT || 3000);
 const HOST = "0.0.0.0";
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
+
+// Твой прод-домен Vercel (подставь свой при желании — иначе работаем по правилу *.vercel.app)
+const PROD_VERCEL =
+  process.env.PROD_VERCEL_ORIGIN ||
+  "https://donation-official-frontend-dcvzqj63a-dn-workbenchs-projects.vercel.app";
+
+// Дополнительно можно указать список доменов через запятую (опционально)
+const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 const STATS_FILE = process.env.STATS_FILE || "stats.json";
 const STATE_FILE = process.env.STATE_FILE || "state.json";
@@ -34,12 +46,44 @@ const TON_WALLET = process.env.TON_WALLET;
 const TONAPI_KEY = process.env.TONAPI_KEY || "";
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 30000);
 
-const ADMIN_KEY = process.env.ADMIN_KEY || ""; // <-- добавь в .env
+const ADMIN_KEY = process.env.ADMIN_KEY || ""; // <-- добавь в .env при использовании админ-ручек
 
 // ===== Fastify app =====
 const app = fastify({ logger: false });
+
+// ---- CORS (исправлено) ----
+// Правила:
+//  - точный прод-домен (PROD_VERCEL)
+//  - любые *.vercel.app (превью)
+//  - локалка http://localhost:5173
+//  - + список из FRONTEND_ORIGINS (через запятую)
+const STATIC_ALLOWED = new Set([
+  PROD_VERCEL,
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  ...FRONTEND_ORIGINS,
+]);
+
 app.register(cors, {
-  origin: FRONTEND_ORIGIN === "*" ? true : FRONTEND_ORIGIN,
+  origin: (origin, cb) => {
+    // Запросы без Origin (напр. curl) — пускаем
+    if (!origin) return cb(null, true);
+
+    // Точная строка из списка
+    if (STATIC_ALLOWED.has(origin)) return cb(null, true);
+
+    // Любой поддомен vercel.app (превью и пр.)
+    try {
+      const u = new URL(origin);
+      if (u.host.endsWith(".vercel.app")) return cb(null, true);
+    } catch (_) {
+      // невалидный Origin — не пускаем
+    }
+
+    return cb(new Error("CORS not allowed"), false);
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "x-admin-key"],
 });
 
 // ===== helpers =====
@@ -62,6 +106,10 @@ function safeWriteJSON(file, data) {
 console.log("🔧 CWD:", process.cwd());
 console.log("📄 STATS_FILE:", path.resolve(STATS_FILE));
 console.log("📄 STATE_FILE:", path.resolve(STATE_FILE));
+console.log("🌐 PROD_VERCEL_ORIGIN:", PROD_VERCEL);
+if (FRONTEND_ORIGINS.length) {
+  console.log("🌐 EXTRA ORIGINS:", FRONTEND_ORIGINS.join(", "));
+}
 
 // ===== state & stats =====
 let stats = safeReadJSON(STATS_FILE, {});
@@ -228,7 +276,6 @@ function startPolling() {
 
 // ===== utils: админ-ключ =====
 function getAdminKey(req) {
-  // можно передавать в заголовке или в теле
   return req.headers["x-admin-key"] || (req.body && req.body.key) || "";
 }
 
@@ -247,12 +294,14 @@ app.get("/health", async (_req, reply) => {
 
 app.get("/stats", async (_req, reply) => {
   ensureBaseCountries(stats);
+  // no-store, чтобы браузер не кэшировал HTTP-ответ
   reply.header("Cache-Control", "no-store");
+  // заголовок CORS отдаст плагин, но можно явно продублировать на время диагностики:
+  // reply.header("Access-Control-Allow-Origin", "*");
   reply.send(stats);
 });
 
 // === ADMIN: установить абсолютное значение по стране ===
-// Body: { key: string, country: string, amount: number }
 app.post("/admin/update-country", async (req, reply) => {
   try {
     const key = getAdminKey(req);
@@ -294,7 +343,6 @@ app.post("/admin/update-country", async (req, reply) => {
 });
 
 // === ADMIN: инкремент/добавить сумму к стране ===
-// Body: { key: string, country: string, delta: number }
 app.post("/admin/add-country", async (req, reply) => {
   try {
     const key = getAdminKey(req);
