@@ -68,8 +68,8 @@ let state = Object.assign({ lastSeenTxId: null }, safeReadJSON(STATE_FILE, {}));
 
 const NANOTONS = 1e9;
 
-// — нормализация стран по комменту —
-const COUNTRY_SET = new Set([
+// — базовые 40 стран — чтобы /stats никогда не был пустым —
+const BASE_COUNTRIES = [
   "United States",
   "India",
   "China",
@@ -110,7 +110,17 @@ const COUNTRY_SET = new Set([
   "Denmark",
   "Ireland",
   "Austria",
-]);
+];
+function ensureBaseCountries(obj) {
+  for (const c of BASE_COUNTRIES) {
+    if (obj[c] == null) obj[c] = 0;
+  }
+}
+// гарантируем базу сразу при старте
+ensureBaseCountries(stats);
+
+// — нормализация стран по комменту —
+const COUNTRY_SET = new Set(BASE_COUNTRIES);
 const ALIASES = {
   USA: "United States",
   US: "United States",
@@ -127,14 +137,27 @@ function normalizeCountry(raw) {
   if (!raw || typeof raw !== "string") return null;
   const s = raw.trim();
   if (!s) return null;
+
+  // точное совпадение как есть
   if (COUNTRY_SET.has(s)) return s;
+
+  // алиасы по верхнему регистру
   const upper = s.toUpperCase();
   if (ALIASES[upper]) return ALIASES[upper];
+
+  // тайтлкейс
   const title =
     s.length < 3 ? s.toUpperCase() : s[0].toUpperCase() + s.slice(1);
   if (COUNTRY_SET.has(title)) return title;
+
+  // полное lower-case совпадение
+  const lower = s.toLowerCase();
+  for (const c of COUNTRY_SET) {
+    if (c.toLowerCase() === lower) return c;
+  }
   return null;
 }
+
 function addDonation(country, amountTON) {
   if (!country || isNaN(amountTON) || amountTON <= 0) return;
   if (!stats[country]) stats[country] = 0;
@@ -182,15 +205,28 @@ async function fetchFromTonapi() {
 async function pollOnce() {
   try {
     await fetchFromTonapi();
+
+    // гарантируем базовые страны каждый проход
+    ensureBaseCountries(stats);
+
+    // сохраняем кэш
     safeWriteJSON(STATS_FILE, stats);
     safeWriteJSON(STATE_FILE, state);
 
+    // отправляем в Google Sheets (если модуль реально подключен)
+    let sheetsOk = false;
     try {
-      await updateStats(stats);
-      console.log("✅ Google Sheet обновлён");
+      if (
+        typeof updateStats === "function" &&
+        updateStats !== (async () => {})
+      ) {
+        await updateStats(stats);
+        sheetsOk = true;
+      }
     } catch (e) {
-      console.warn("⚠️  Sheets пропущен:", e.message);
+      console.warn("⚠️  Sheets ошибка:", e.message);
     }
+    if (sheetsOk) console.log("✅ Google Sheet обновлён");
 
     const top5 = Object.entries(stats)
       .sort((a, b) => b[1] - a[1])
@@ -212,7 +248,10 @@ function startPolling() {
 app.get("/health", async (_req, reply) => {
   reply.send({ ok: true, lastSeenTxId: state.lastSeenTxId });
 });
+
 app.get("/stats", async (_req, reply) => {
+  // отдаём всегда с базой (на случай, если кто-то руками потёр файл)
+  ensureBaseCountries(stats);
   reply.header("Cache-Control", "no-store");
   reply.send(stats);
 });
