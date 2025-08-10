@@ -10,7 +10,12 @@ const SHEET_TITLE = process.env.SHEET_TITLE || "Stats";
 function readServiceAccount() {
   if (process.env.GOOGLE_CREDENTIALS) {
     try {
-      return JSON.parse(process.env.GOOGLE_CREDENTIALS);
+      const parsed = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+      // 🔧 важно: превратить "\\n" в реальные переводы строк
+      if (parsed.private_key && typeof parsed.private_key === "string") {
+        parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
+      }
+      return parsed;
     } catch (e) {
       throw new Error("GOOGLE_CREDENTIALS не парсится: " + e.message);
     }
@@ -20,12 +25,26 @@ function readServiceAccount() {
   }
   const filePath = path.resolve(process.env.GOOGLE_CREDENTIALS_PATH);
   const raw = fs.readFileSync(filePath, "utf8");
-  return JSON.parse(raw);
+  const parsed = JSON.parse(raw);
+  if (parsed.private_key && typeof parsed.private_key === "string") {
+    parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
+  }
+  return parsed;
 }
 
 function getSheetsClient() {
   if (!SPREADSHEET_ID) throw new Error("SPREADSHEET_ID не задан");
   const creds = readServiceAccount();
+
+  // 👇 полезный лог — виден в Render logs (не содержит приватный ключ!)
+  console.log(
+    "🟢 Sheets auth as:",
+    creds.client_email,
+    "| spreadsheet:",
+    SPREADSHEET_ID,
+    "| sheet:",
+    SHEET_TITLE
+  );
 
   const auth = new google.auth.JWT({
     email: creds.client_email,
@@ -61,6 +80,7 @@ async function ensureSheetExists(sheets) {
 }
 
 async function updateStats(statsObj) {
+  // более подробные ошибки наружу — чтобы их было видно в Render logs
   try {
     const sheets = getSheetsClient();
     await ensureSheetExists(sheets);
@@ -76,11 +96,12 @@ async function updateStats(statsObj) {
     ];
 
     const range = `${SHEET_TITLE}!A1:C`;
-    // очищаем и записываем заново
+
     await sheets.spreadsheets.values.clear({
       spreadsheetId: SPREADSHEET_ID,
       range,
     });
+
     await sheets.spreadsheets.values.update({
       spreadsheetId: SPREADSHEET_ID,
       range: `${SHEET_TITLE}!A1`,
@@ -113,14 +134,15 @@ async function updateStats(statsObj) {
           ],
         },
       });
-    } catch (_) {}
+    } catch (e) {
+      console.warn("ℹ️ Автоширина не применена:", e.message);
+    }
 
-    console.log("✅ Google Sheet обновлён");
+    console.log("✅ Google Sheet обновлён:", rows.length, "строк");
   } catch (err) {
-    console.warn(
-      "⚠️  updateStats: не удалось обновить Google Sheets:",
-      err.message
-    );
+    // раньше тут была тихая варнинга — сделаем явную ошибку
+    console.error("❌ updateStats error:", err.response?.data || err.message);
+    throw err;
   }
 }
 
