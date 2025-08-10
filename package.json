@@ -1,20 +1,20 @@
 {
-  "name": "ton-donates",
+  "name": "ton-donates-backend",
   "version": "1.0.0",
+  "description": "Backend для мониторинга донатов в TON и обновления Google Sheets",
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
   "dependencies": {
-    "axios": "^1.11.0",
+    "axios": "^1.6.7",
     "cors": "^2.8.5",
-    "dotenv": "^17.2.1",
-    "express": "^5.1.0",
-    "googleapis": "^154.0.0",
-    "lucide-react": "^0.534.0"
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "googleapis": "^126.0.1"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
