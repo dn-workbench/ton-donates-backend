@@ -1,4 +1,13 @@
-// index.js (Fastify backend with robust CORS)
+// index.js — Fastify backend (hardened)
+// ─────────────────────────────────────────────────────────────────────────────
+// Ключевые отличия:
+//  - Атомарная запись JSON (tmp → rename), отдельная папка data/
+//  - Пагинация TonAPI до PAGE_LIMIT, чтобы не пропускать транзакции
+//  - Валидация входящих тел (fastify schema) для админ-ручек
+//  - CORS: точные origin'ы + *.vercel.app + локалка
+//  - Graceful shutdown (SIGINT/SIGTERM)
+//  - Лёгкий джиттер интервала опроса TonAPI
+//  - Аккуратные логи и защита от кривых JSON
 
 require("dotenv").config();
 
@@ -8,7 +17,7 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 
-// ===== Google Sheets (мягкий импорт) =====
+// ─── Optional Google Sheets ──────────────────────────────────────────────────
 let updateStats = async () => {};
 try {
   ({ updateStats } = require("./googleSheets"));
@@ -17,6 +26,7 @@ try {
   console.warn("⚠️  googleSheets не подключен:", e?.message || e);
 }
 
+// ─── Process-level error guards ──────────────────────────────────────────────
 process.on("uncaughtException", (err) =>
   console.error("💥 uncaughtException:", err)
 );
@@ -24,39 +34,41 @@ process.on("unhandledRejection", (reason) =>
   console.error("💥 unhandledRejection:", reason)
 );
 
-// ===== ENV =====
+// ─── ENV ─────────────────────────────────────────────────────────────────────
 const PORT = Number(process.env.PORT || 3000);
-const HOST = "0.0.0.0";
+const HOST = process.env.HOST || "0.0.0.0";
 
-// Твой прод-домен Vercel (подставь свой при желании — иначе работаем по правилу *.vercel.app)
 const PROD_VERCEL =
   process.env.PROD_VERCEL_ORIGIN ||
-  "https://donation-official-frontend-dcvzqj63a-dn-workbenchs-projects.vercel.app";
+  "https://donation-official-frontend.vercel.app";
 
-// Дополнительно можно указать список доменов через запятую (опционально)
 const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const STATS_FILE = process.env.STATS_FILE || "stats.json";
-const STATE_FILE = process.env.STATE_FILE || "state.json";
+const DATA_DIR = process.env.DATA_DIR || "./data";
+const STATS_FILE = path.resolve(
+  DATA_DIR,
+  process.env.STATS_FILE || "stats.json"
+);
+const STATE_FILE = path.resolve(
+  DATA_DIR,
+  process.env.STATE_FILE || "state.json"
+);
 
-const TON_WALLET = process.env.TON_WALLET;
+const TON_WALLET = process.env.TON_WALLET || "";
 const TONAPI_KEY = process.env.TONAPI_KEY || "";
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 30000);
+// Предел по страницам на одну итерацию опроса:
+const PAGE_LIMIT = Number(process.env.PAGE_LIMIT || 5);
 
-const ADMIN_KEY = process.env.ADMIN_KEY || ""; // <-- добавь в .env при использовании админ-ручек
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
 
-// ===== Fastify app =====
-const app = fastify({ logger: false });
+// ─── App ─────────────────────────────────────────────────────────────────────
+const app = fastify({ logger: true });
 
-// ---- CORS (исправлено) ----
-// Правила:
-//  - точный прод-домен (PROD_VERCEL)
-//  - любые *.vercel.app (превью)
-//  - локалка http://localhost:5173
-//  - + список из FRONTEND_ORIGINS (через запятую)
+// ─── CORS ────────────────────────────────────────────────────────────────────
 const STATIC_ALLOWED = new Set([
   PROD_VERCEL,
   "http://localhost:5173",
@@ -66,57 +78,60 @@ const STATIC_ALLOWED = new Set([
 
 app.register(cors, {
   origin: (origin, cb) => {
-    // Запросы без Origin (напр. curl) — пускаем
-    if (!origin) return cb(null, true);
-
-    // Точная строка из списка
+    if (!origin) return cb(null, true); // curl / direct
     if (STATIC_ALLOWED.has(origin)) return cb(null, true);
-
-    // Любой поддомен vercel.app (превью и пр.)
     try {
       const u = new URL(origin);
       if (u.host.endsWith(".vercel.app")) return cb(null, true);
-    } catch (_) {
-      // невалидный Origin — не пускаем
-    }
-
+    } catch (_) {}
+    app.log.warn({ origin }, "CORS rejected");
     return cb(new Error("CORS not allowed"), false);
   },
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "x-admin-key"],
 });
 
-// ===== helpers =====
+// ─── FS helpers (atomic write) ───────────────────────────────────────────────
+function ensureDir(p) {
+  fs.mkdirSync(p, { recursive: true });
+}
 function safeReadJSON(file, fallback) {
   try {
-    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, "utf8"));
+    if (fs.existsSync(file)) {
+      const text = fs.readFileSync(file, "utf8");
+      return JSON.parse(text);
+    }
   } catch (e) {
-    console.warn(`⚠️  Не удалось прочитать ${file}:`, e.message);
+    app.log.warn({ file, err: e.message }, "readJSON failed");
   }
   return fallback;
 }
-function safeWriteJSON(file, data) {
+function atomicWriteJSON(file, data) {
   try {
-    fs.writeFileSync(file, JSON.stringify(data, null, 2));
+    const tmp = file + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+    fs.renameSync(tmp, file);
   } catch (e) {
-    console.warn(`⚠️  Не удалось записать ${file}:`, e.message);
+    app.log.warn({ file, err: e.message }, "writeJSON failed");
   }
 }
 
-console.log("🔧 CWD:", process.cwd());
-console.log("📄 STATS_FILE:", path.resolve(STATS_FILE));
-console.log("📄 STATE_FILE:", path.resolve(STATE_FILE));
-console.log("🌐 PROD_VERCEL_ORIGIN:", PROD_VERCEL);
-if (FRONTEND_ORIGINS.length) {
-  console.log("🌐 EXTRA ORIGINS:", FRONTEND_ORIGINS.join(", "));
-}
+// ─── Boot: paths info ────────────────────────────────────────────────────────
+ensureDir(DATA_DIR);
+app.log.info({ CWD: process.cwd() }, "boot");
+app.log.info({ STATS_FILE, STATE_FILE }, "paths");
+app.log.info(
+  { PROD_VERCEL_ORIGIN: PROD_VERCEL, EXTRA_ORIGINS: FRONTEND_ORIGINS },
+  "CORS"
+);
 
-// ===== state & stats =====
+// ─── State & stats ───────────────────────────────────────────────────────────
 let stats = safeReadJSON(STATS_FILE, {});
 let state = Object.assign({ lastSeenTxId: null }, safeReadJSON(STATE_FILE, {}));
+
 const NANOTONS = 1e9;
 
-// — базовые 40 стран — чтобы /stats никогда не был пустым —
+// Базовые страны (чтобы фронт не пустел)
 const BASE_COUNTRIES = [
   "United States",
   "India",
@@ -164,7 +179,7 @@ function ensureBaseCountries(obj) {
 }
 ensureBaseCountries(stats);
 
-// — нормализация стран по комменту —
+// Нормализация стран
 const COUNTRY_SET = new Set(BASE_COUNTRIES);
 const ALIASES = {
   USA: "United States",
@@ -183,13 +198,17 @@ function normalizeCountry(raw) {
   const s = raw.trim();
   if (!s) return null;
   if (COUNTRY_SET.has(s)) return s;
+
   const upper = s.toUpperCase();
   if (ALIASES[upper]) return ALIASES[upper];
+
   const title =
     s.length < 3 ? s.toUpperCase() : s[0].toUpperCase() + s.slice(1);
   if (COUNTRY_SET.has(title)) return title;
+
   const lower = s.toLowerCase();
   for (const c of COUNTRY_SET) if (c.toLowerCase() === lower) return c;
+
   return null;
 }
 function addDonation(country, amountTON) {
@@ -198,93 +217,118 @@ function addDonation(country, amountTON) {
   stats[country] = Number((stats[country] + amountTON).toFixed(6));
 }
 
-// ===== TonAPI polling =====
-async function fetchFromTonapi() {
+// ─── TonAPI polling (with pagination) ────────────────────────────────────────
+async function fetchFromTonapiPaged() {
   if (!TON_WALLET) throw new Error("TON_WALLET не задан в .env");
 
-  const url = `https://tonapi.io/v2/blockchain/accounts/${TON_WALLET}/transactions?limit=50`;
   const headers = TONAPI_KEY ? { Authorization: `Bearer ${TONAPI_KEY}` } : {};
+  let page = 0;
+  let stop = false;
+  let newestId = state.lastSeenTxId || null;
 
-  const { data } = await axios.get(url, { headers, timeout: 15000 });
-  const items = data?.transactions || data?.items || [];
-  if (!Array.isArray(items) || items.length === 0) return;
+  // крутим страницы, пока не встретим lastSeenTxId или не превысим PAGE_LIMIT
+  while (!stop && page < PAGE_LIMIT) {
+    const url = `https://tonapi.io/v2/blockchain/accounts/${TON_WALLET}/transactions?limit=50&offset=${
+      page * 50
+    }`;
+    const { data } = await axios.get(url, { headers, timeout: 15000 });
 
-  for (const tx of items) {
-    const inMsg = tx?.in_msg;
-    if (!inMsg) continue; // только входящие
+    const items = data?.transactions || data?.items || [];
+    if (!Array.isArray(items) || items.length === 0) break;
 
-    const txId = tx?.hash || tx?.transaction_id?.hash || tx?.lt;
-    if (state.lastSeenTxId && txId && txId === state.lastSeenTxId) break;
+    // гарантируем порядок от новых к старым
+    items.sort((a, b) => {
+      const at = a.utime || a.now || 0;
+      const bt = b.utime || b.now || 0;
+      return bt - at;
+    });
 
-    const valueNano =
-      Number(inMsg?.value) || Number(inMsg?.amount) || Number(tx?.value) || 0;
+    for (const tx of items) {
+      const inMsg = tx?.in_msg;
+      if (!inMsg) continue; // только входящие
 
-    const comment =
-      inMsg?.decoded?.comment || inMsg?.message || tx?.message || null;
+      const txId = tx?.hash || tx?.transaction_id?.hash || tx?.lt;
+      if (state.lastSeenTxId && txId && txId === state.lastSeenTxId) {
+        stop = true;
+        break;
+      }
 
-    const country = normalizeCountry(comment);
-    if (country && valueNano > 0) addDonation(country, valueNano / NANOTONS);
+      const valueNano =
+        Number(inMsg?.value) || Number(inMsg?.amount) || Number(tx?.value) || 0;
+
+      const comment =
+        inMsg?.decoded?.comment || inMsg?.message || tx?.message || null;
+
+      const country = normalizeCountry(comment);
+      if (country && valueNano > 0) addDonation(country, valueNano / NANOTONS);
+
+      // сохраняем id самой новой транзакции из первой страницы (или первой итерации)
+      if (!newestId) {
+        newestId = txId || newestId;
+      }
+    }
+
+    // если прошлись по странице и не встретили lastSeenTxId — идём дальше
+    page += 1;
   }
 
-  const newest = items[0];
-  if (newest) {
-    state.lastSeenTxId =
-      newest?.hash ||
-      newest?.transaction_id?.hash ||
-      newest?.lt ||
-      state.lastSeenTxId;
+  if (newestId) {
+    state.lastSeenTxId = newestId;
   }
 }
 
 async function pollOnce() {
   try {
-    await fetchFromTonapi();
-    ensureBaseCountries(stats); // на всякий случай
+    await fetchFromTonapiPaged();
+    ensureBaseCountries(stats);
 
-    // сохраняем кэш
-    safeWriteJSON(STATS_FILE, stats);
-    safeWriteJSON(STATE_FILE, state);
+    atomicWriteJSON(STATS_FILE, stats);
+    atomicWriteJSON(STATE_FILE, state);
 
-    // отправляем в Google Sheets (если модуль реально подключен)
+    // Google Sheet (если подключен)
     try {
       if (
         typeof updateStats === "function" &&
         updateStats !== (async () => {})
       ) {
         await updateStats(stats);
-        console.log("✅ Google Sheet обновлён");
+        app.log.info("✅ Google Sheet обновлён");
       }
     } catch (e) {
-      console.warn("⚠️  Sheets ошибка:", e.message);
+      app.log.warn({ err: e.message }, "Sheets error");
     }
 
     const top5 = Object.entries(stats)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 5);
-    console.log("📊 Топ-5:", top5);
+    app.log.info({ top5 }, "stats updated");
   } catch (e) {
-    console.error("❌ Ошибка опроса:", e.message);
+    app.log.error({ err: e.message }, "pollOnce error");
   }
 }
 
 let timer = null;
 function startPolling() {
   if (timer) clearInterval(timer);
-  timer = setInterval(pollOnce, POLL_INTERVAL_MS);
+  // лёгкий джиттер, чтоб не синхронизироваться с другими инстансами/лимитами
+  const base = POLL_INTERVAL_MS;
+  const jitter = Math.floor(Math.random() * 5000);
+  timer = setInterval(pollOnce, base + jitter);
+  // первый прогон сразу
   pollOnce();
 }
 
-// ===== utils: админ-ключ =====
+// ─── Admin auth helper ──────────────────────────────────────────────────────
 function getAdminKey(req) {
   return req.headers["x-admin-key"] || (req.body && req.body.key) || "";
 }
 
-// ===== routes =====
+// ─── Routes ─────────────────────────────────────────────────────────────────
 app.get("/", async (_req, reply) => {
   reply.send({
     ok: true,
     message: "TON donations backend",
-    endpoints: ["/health", "/stats"],
+    endpoints: ["/health", "/stats", "/admin/*"],
   });
 });
 
@@ -294,99 +338,154 @@ app.get("/health", async (_req, reply) => {
 
 app.get("/stats", async (_req, reply) => {
   ensureBaseCountries(stats);
-  // no-store, чтобы браузер не кэшировал HTTP-ответ
   reply.header("Cache-Control", "no-store");
-  // заголовок CORS отдаст плагин, но можно явно продублировать на время диагностики:
-  // reply.header("Access-Control-Allow-Origin", "*");
   reply.send(stats);
 });
 
-// === ADMIN: установить абсолютное значение по стране ===
-app.post("/admin/update-country", async (req, reply) => {
-  try {
-    const key = getAdminKey(req);
-    if (!ADMIN_KEY || key !== ADMIN_KEY)
-      return reply.code(403).send({ error: "Forbidden" });
+// ─── Schemas for admin routes ────────────────────────────────────────────────
+const updateCountrySchema = {
+  body: {
+    type: "object",
+    required: ["country", "amount"],
+    properties: {
+      country: { type: "string", minLength: 1 },
+      amount: { type: "number", minimum: 0 },
+    },
+    additionalProperties: false,
+  },
+};
 
-    const { country, amount } = req.body || {};
-    const normalized = normalizeCountry(country);
-    if (!normalized) return reply.code(400).send({ error: "Unknown country" });
+const addCountrySchema = {
+  body: {
+    type: "object",
+    required: ["country", "delta"],
+    properties: {
+      country: { type: "string", minLength: 1 },
+      delta: { type: "number" },
+    },
+    additionalProperties: false,
+  },
+};
 
-    const num = Number(amount);
-    if (!Number.isFinite(num) || num < 0)
-      return reply.code(400).send({ error: "Invalid amount" });
-
-    stats[normalized] = Number(num.toFixed(6));
-    ensureBaseCountries(stats);
-    safeWriteJSON(STATS_FILE, stats);
-
+// === ADMIN: set absolute amount ===
+app.post(
+  "/admin/update-country",
+  { schema: updateCountrySchema },
+  async (req, reply) => {
     try {
-      if (
-        typeof updateStats === "function" &&
-        updateStats !== (async () => {})
-      ) {
-        await updateStats(stats);
+      const key = getAdminKey(req);
+      if (!ADMIN_KEY || key !== ADMIN_KEY)
+        return reply.code(403).send({ error: "Forbidden" });
+
+      const { country, amount } = req.body;
+      const normalized = normalizeCountry(country);
+      if (!normalized)
+        return reply.code(400).send({ error: "Unknown country" });
+
+      stats[normalized] = Number(Number(amount).toFixed(6));
+      ensureBaseCountries(stats);
+      atomicWriteJSON(STATS_FILE, stats);
+
+      try {
+        if (
+          typeof updateStats === "function" &&
+          updateStats !== (async () => {})
+        ) {
+          await updateStats(stats);
+        }
+      } catch (e) {
+        app.log.warn({ err: e.message }, "Sheets error");
       }
+
+      return reply.send({
+        ok: true,
+        country: normalized,
+        amount: stats[normalized],
+      });
     } catch (e) {
-      console.warn("⚠️  Sheets ошибка:", e.message);
+      app.log.error({ err: e }, "/admin/update-country");
+      return reply.code(500).send({ error: "Internal error" });
     }
+  }
+);
+
+// === ADMIN: increment by delta ===
+app.post(
+  "/admin/add-country",
+  { schema: addCountrySchema },
+  async (req, reply) => {
+    try {
+      const key = getAdminKey(req);
+      if (!ADMIN_KEY || key !== ADMIN_KEY)
+        return reply.code(403).send({ error: "Forbidden" });
+
+      const { country, delta } = req.body;
+      const normalized = normalizeCountry(country);
+      if (!normalized)
+        return reply.code(400).send({ error: "Unknown country" });
+
+      const d = Number(delta);
+      if (!Number.isFinite(d))
+        return reply.code(400).send({ error: "Invalid delta" });
+
+      if (!stats[normalized]) stats[normalized] = 0;
+      stats[normalized] = Number((stats[normalized] + d).toFixed(6));
+      if (stats[normalized] < 0) stats[normalized] = 0;
+
+      ensureBaseCountries(stats);
+      atomicWriteJSON(STATS_FILE, stats);
+
+      try {
+        if (
+          typeof updateStats === "function" &&
+          updateStats !== (async () => {})
+        ) {
+          await updateStats(stats);
+        }
+      } catch (e) {
+        app.log.warn({ err: e.message }, "Sheets error");
+      }
+
+      return reply.send({
+        ok: true,
+        country: normalized,
+        amount: stats[normalized],
+      });
+    } catch (e) {
+      app.log.error({ err: e }, "/admin/add-country");
+      return reply.code(500).send({ error: "Internal error" });
+    }
+  }
+);
+
+// === ADMIN: ручная синхронизация с Google Sheets ===
+app.post("/admin/sync-sheets", async (req, reply) => {
+  try {
+    const key = req.headers["x-admin-key"] || "";
+    if (!ADMIN_KEY || key !== ADMIN_KEY) {
+      return reply.code(403).send({ error: "Forbidden" });
+    }
+
+    if (typeof updateStats !== "function") {
+      return reply
+        .code(500)
+        .send({ ok: false, error: "Sheets module not loaded" });
+    }
+
+    const res = await updateStats(stats);
 
     return reply.send({
       ok: true,
-      country: normalized,
-      amount: stats[normalized],
+      message: "Synced to Google Sheets",
+      ...res,
     });
   } catch (e) {
-    console.error("❌ /admin/update-country:", e);
-    return reply.code(500).send({ error: "Internal error" });
+    req.log.error(e, "sync-sheets failed");
+    return reply.code(500).send({ ok: false, error: e.message });
   }
 });
 
-// === ADMIN: инкремент/добавить сумму к стране ===
-app.post("/admin/add-country", async (req, reply) => {
-  try {
-    const key = getAdminKey(req);
-    if (!ADMIN_KEY || key !== ADMIN_KEY)
-      return reply.code(403).send({ error: "Forbidden" });
-
-    const { country, delta } = req.body || {};
-    const normalized = normalizeCountry(country);
-    if (!normalized) return reply.code(400).send({ error: "Unknown country" });
-
-    const d = Number(delta);
-    if (!Number.isFinite(d))
-      return reply.code(400).send({ error: "Invalid delta" });
-
-    if (!stats[normalized]) stats[normalized] = 0;
-    stats[normalized] = Number((stats[normalized] + d).toFixed(6));
-    if (stats[normalized] < 0) stats[normalized] = 0;
-
-    ensureBaseCountries(stats);
-    safeWriteJSON(STATS_FILE, stats);
-
-    try {
-      if (
-        typeof updateStats === "function" &&
-        updateStats !== (async () => {})
-      ) {
-        await updateStats(stats);
-      }
-    } catch (e) {
-      console.warn("⚠️  Sheets ошибка:", e.message);
-    }
-
-    return reply.send({
-      ok: true,
-      country: normalized,
-      amount: stats[normalized],
-    });
-  } catch (e) {
-    console.error("❌ /admin/add-country:", e);
-    return reply.code(500).send({ error: "Internal error" });
-  }
-});
-
-// ===== start =====
+// ─── Start & graceful shutdown ───────────────────────────────────────────────
 app.listen({ port: PORT, host: HOST }, (err, address) => {
   if (err) {
     console.error("❌ Fastify listen error:", err);
@@ -399,3 +498,16 @@ app.listen({ port: PORT, host: HOST }, (err, address) => {
     startPolling();
   }
 });
+
+async function shutdown() {
+  try {
+    if (timer) clearInterval(timer);
+    await app.close();
+  } catch (e) {
+    console.error("shutdown error:", e);
+  } finally {
+    process.exit(0);
+  }
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
